@@ -1,0 +1,125 @@
+# ecg_sigma default pipeline configuration.
+#
+# Override individual fields via a user-supplied YAML; the loader merges
+# user values on top of these defaults.
+
+# ----------------------------- I/O ------------------------------------------
+output_dir: ./out
+file_pattern: "{patient_id}_{year}-{month:02d}.h5"
+compression: gzip
+compression_opts: 4
+
+# Anchor for synthesised event timestamps when the source dataset has none.
+# Datasets like MIT-BIH/INCART carry no real wall-clock time; events are
+# placed deterministically relative to this anchor + a per-record offset.
+timestamp_anchor: "2025-01-01T00:00:00Z"
+
+# How many historical vital snapshots a downstream device should retain.
+# Written verbatim to /metadata/max_vital_history.
+max_vital_history: 30
+
+# ----------------------------- Schema ---------------------------------------
+schema:
+  ecg_fs: 200.0           # Hz
+  ppg_fs: 75.0            # Hz
+  resp_fs: 33.333333      # Hz (== 100/3, gives 400 samples per 12 s)
+  seconds_before_event: 6
+  seconds_after_event: 6
+  device_info: "RMSAI-SimDevice-v2.0"
+  leads: ["ECG1", "ECG2", "ECG3", "aVR", "aVL", "aVF", "vVX"]
+
+# ----------------------------- Signal processing ----------------------------
+signal:
+  ecg_bandpass_hz: [0.5, 40.0]
+  ecg_notch_hz: 50.0       # power-line; set to null to disable
+  ecg_notch_q: 30.0
+  rpeak_min_distance_s: 0.30
+  rpeak_min_height_z: 0.6  # in z-score units of bandpassed signal
+
+# ----------------------------- Synthesis ------------------------------------
+synthesis:
+  ppg_pulse_delay_s: 0.20         # PEP + PWTT, ECG R-peak -> PPG foot
+  ppg_systolic_width_s: 0.10
+  ppg_dicrotic_offset_s: 0.30
+  ppg_dicrotic_amp: 0.35
+  resp_method: edr                # 'edr' or 'sinusoidal'
+  resp_default_rate_brpm: 15
+  resp_noise_std: 0.05
+
+# ----------------------------- Vitals ---------------------------------------
+vitals:
+  spo2:
+    NORMAL_SINUS:    [96, 99]
+    AFIB:            [93, 98]
+    PVC:             [94, 99]
+    PAC:             [95, 99]
+    VTACH:           [85, 92]
+    VFIB:            [70, 85]
+    BRADYCARDIA:     [92, 98]
+    TACHYCARDIA:     [93, 98]
+    PAUSE:           [90, 96]
+    MI:              [90, 96]
+    OTHER:           [92, 98]
+  bp_systolic:
+    NORMAL_SINUS:    [110, 130]
+    AFIB:            [100, 145]
+    PVC:             [108, 135]
+    PAC:             [108, 132]
+    VTACH:           [70, 95]
+    VFIB:            [40, 70]
+    BRADYCARDIA:     [95, 120]
+    TACHYCARDIA:     [115, 150]
+    PAUSE:           [80, 110]
+    MI:              [85, 130]
+    OTHER:           [105, 135]
+  bp_diastolic_offset: [55, 85]   # diastolic = systolic - rand(offset)... see code
+  temp_f: [97.5, 99.5]            # NOTE: degrees Fahrenheit (per the schema)
+  postures: ["Supine", "LeftLat", "RightLat", "Prone", "Sitting", "Standing"]
+  step_count_range: [0, 3000]
+  time_since_posture_change_range: [0, 3600]
+  # Per-vital alarm thresholds; absent vitals fall back to VITAL_PROFILES.
+  # Format: VITAL_NAME: [lower, upper]
+  thresholds:
+    HR:        [50, 110]
+    Pulse:     [50, 110]
+    SpO2:      [90, 100]
+    Systolic:  [90, 160]
+    Diastolic: [50, 100]
+    RespRate:  [8, 30]
+    Temp:      [96.0, 101.0]
+
+# ----------------------------- Pacer ----------------------------------------
+# Probability of a pacer being active per condition; the writer emits
+# {"pacer_info": 0, "pacer_offset": 0} when no pacer is generated.
+pacer:
+  default_probability: 0.05
+  probabilities:
+    VTACH:       0.40
+    VFIB:        0.40
+    BRADYCARDIA: 0.80
+
+# ----------------------------- Run-time -------------------------------------
+runtime:
+  random_seed: 42
+  log_level: INFO
+  workers: 1                  # set >1 to parallelise across records
+  fail_fast: false            # if true, propagate the first record-level error
+
+# ----------------------------- Datasets -------------------------------------
+datasets:
+  mitbih:
+    enabled: true
+    path: null                # required at run time if enabled
+    record_pattern: null      # optional list of record names to include
+    beat_symbols: ["N", "V", "A", "F", "L", "R", "/", "!", "E", "j", "a", "S"]
+    max_events_per_record: 200
+  ptbxl:
+    enabled: false
+    path: null
+    use_diagnostic_superclass: true
+    max_events_per_record: 1
+  incart:
+    enabled: false
+    path: null
+    beat_symbols: ["N", "V", "A", "F", "R", "B", "S"]
+    max_events_per_record: 200

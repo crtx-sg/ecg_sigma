@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecg_sigma"
+version = "0.1.0"
+description = "ICU-style HDF5 synthetic-data generator for ECG arrhythmia alarm modeling"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "ECG Sigma" }]
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "h5py>=3.8",
+    "wfdb>=4.1",
+    "PyYAML>=6.0",
+    "pandas>=2.0",
+]
+
+[project.scripts]
+ecg-sigma-mitbih = "ecg_sigma.scripts.process_mitbih:main"
+
+[tool.setuptools.packages.find]
+include = ["ecg_sigma*"]

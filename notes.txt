@@ -1,0 +1,3 @@
+
+# to generate hdf5 out from the mit data
+python scripts/process_mitbih.py     --mitbih-path ./mit-bih-arrhythmia-database-1.0.0     --out ./out     --records 100 101     --max-events-per-record 50
