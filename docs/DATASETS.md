@@ -169,13 +169,58 @@ Output will land under `out/ptbxl/{patient_id}_{YYYY-MM}.h5`. The
 `{patient_id}` is taken from PTB-XL's column of the same name and is
 prefixed with `PTBXL-` to disambiguate from MIT-BIH numerical ids.
 
-### 2c. Limitations
+### 2c. PTB-XL needs a 10-second window — read this first
 
-* PTB-XL is short (10 s) so each record produces **one** event located
-  at the centre of the recording. Crank `max_events_per_record` higher
-  only after extending the loader to slide a window across each record.
+**PTB-XL records are 10 s. The default schema window is 12 s
+(`seconds_before_event: 6` + `seconds_after_event: 6`). Every event
+falls off the end of the record, so PTB-XL produces _zero_ output under
+the default config.** The pipeline now raises `ConfigurationError` on
+the first such record instead of silently dropping all 21,837.
+
+There is no way to get 12 s of real signal out of a 10 s recording, so
+you have two honest options:
+
+1. **Run PTB-XL as a separate 10 s dataset.** Add to `ptbxl.yaml`:
+
+   ```yaml
+   schema:
+     seconds_before_event: 5
+     seconds_after_event: 5
+   ```
+
+   This yields **2000-sample** ECG (750 PPG / 333 RESP) files that are
+   **not interchangeable** with the 2400-sample MIT-BIH/INCART output.
+   Train on them as a separate corpus, or resample downstream.
+
+2. **Leave PTB-XL disabled** and use INCART for 12-lead coverage.
+
+What PTB-XL buys you when you do run it: with real `I`, `II`, `III` and
+`V1..V6` on disk, only `aVR`/`aVL`/`aVF` are derived — and they come
+from genuine Einthoven on real limb leads, not from a fabricated Lead I
+the way MIT-BIH's do. Real-lead ratio is 4/7 vs MIT-BIH's 2/7.
+
+### 2d. Other limitations
+
+* Each record produces **one** event at the centre of the recording.
+  Crank `max_events_per_record` higher only after extending the loader
+  to slide a window across each record.
 * PTB-XL ships only resting 12-lead ECG — no native PPG/RESP.
   Everything except the ECG itself is synthesised; see ASSUMPTIONS.md.
+* `patient_id` is the PTB-XL patient (not the ECG id), and the writer
+  overwrites per `(patient, year, month)` — a patient with several
+  records keeps only the last one written. Fix before a full-corpus run.
+* PTB-XL's `recording_date` column is not yet wired to
+  `PatientRecord.base_time_epoch`, so events use the synthetic anchor.
+
+---
+
+## 2e. MIT-BIH: records excluded from conversion
+
+**Records 102 and 104 do not convert.** Both carry `V5 + V2` with no
+limb lead, and Lead II drives six of the seven output leads plus HR,
+PPG and RESP. The pipeline raises rather than emitting a zero-filled
+montage; expect **46 of 48** records and an `ERROR` line for each of the
+two. See ASSUMPTIONS.md §2.
 
 ---
 
@@ -205,7 +250,12 @@ datasets:
     enabled: true
     path: ./data/incart
     max_events_per_record: 200
-    beat_symbols: ["N", "V", "A", "F", "R", "B", "S"]
+    # Symbols actually present in INCART, by frequency:
+    #   N 150410  V 20013  R 3174  A 1944  F 219  j 92  n 32  S 16  Q 6  B 1
+    # NB "B" is a bundle-branch-block BEAT symbol here (1 occurrence), not
+    # the "(B" ventricular-bigeminy RHYTHM code. "n" (supraventricular
+    # escape) has no unified label yet and falls through to OTHER.
+    beat_symbols: ["N", "V", "A", "F", "R", "S", "j", "n"]
 runtime:
   workers: 4
 ```
@@ -219,10 +269,34 @@ Pipeline(load_config('incart.yaml')).run()
 "
 ```
 
+### 3d. Measured results (full run, 75/75 records)
+
 INCART benefits the most from the pipeline because it ships **12 real
-leads**: every output ECG channel will be tagged
-`{"source": "real", "method": "direct"}` except for `vVX`, which still
-resolves to V1 (real, direct).
+leads**. Confirmed on a full conversion: all 11,404 events across all 75
+records are tagged `{"source": "real", "method": "direct"}` on **every
+one of the seven** output channels, `vVX` (from V1) included. Nothing in
+the ECG is synthesised.
+
+```
+files: 75    events: 11,404    1.3 GB    ~35 min @ 4 workers    75/75 validate
+
+NORMAL_SINUS 5876 51.5%    AFIB  400  3.5%
+PVC          4034 35.4%    RBBB  208  1.8%
+PAC           854  7.5%    OTHER  32  0.3%
+
+data_quality_score 0.09-0.50 (mean 0.27); 21 files warn below 0.20
+HR 22.2 / 78.4 / 184.6 bpm (min/median/max); 22 events (0.2%) on the fallback
+```
+
+**The catch: INCART has almost no rhythm labels.** The entire database
+carries **12** rhythm annotations — `(PREX` ×7, `(WPWAF` ×3, `(AFIB` ×2 —
+so conditions come from beat morphology alone. There is no VTACH,
+BRADYCARDIA, TACHYCARDIA, LBBB, PACED or VFIB in the output. For those
+classes you need MIT-BIH, which has 1,291 rhythm annotations but only
+2 of 7 real leads. Plan on using both.
+
+`(WPWAF` (WPW with atrial fibrillation) is not in `MITBIH_RHYTHM_MAP`; those
+3 annotations currently fall back to the beat label.
 
 ---
 

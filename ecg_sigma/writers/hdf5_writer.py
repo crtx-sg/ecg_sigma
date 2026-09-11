@@ -10,7 +10,9 @@ File layout (strict; see README and ASSUMPTIONS for details):
     │            seconds_before_event, seconds_after_event,
     │            data_quality_score, device_info, max_vital_history
     └── /event_1001 ...                            (group; one per event)
-          attrs: condition, heart_rate, event_timestamp        (only these)
+          attrs: condition, heart_rate, event_timestamp        (spec'd)
+                 source_label, source_sample,                  (traceability)
+                 source_beat_condition, source_rhythm_condition
           /timestamp                                            (scalar float64)
           /uuid                                                 (scalar utf-8 string)
           /ecg/{ECG1,ECG2,ECG3,aVR,aVL,aVF,vVX}                 (1-D float32, gzip)
@@ -66,7 +68,7 @@ class EventPayload:
     """Everything needed to write a single ``/event_NNNN`` group."""
 
     condition: str
-    source_label: str                                    # carried but not written
+    source_label: str                                    # raw dataset label
     event_timestamp_epoch: float
     heart_rate_bpm: float
     data_quality_score: float                            # aggregated into /metadata
@@ -77,6 +79,13 @@ class EventPayload:
     pacer_info: int = 0                                  # bit-packed, 0 = no pacer
     pacer_offset: int = 0                                # ECG sample index
     extras: Dict[str, Any] = field(default_factory=dict)
+
+    # Traceability back to the source annotation. ``source_sample`` is the
+    # onset index in *source-fs* coordinates, so an event can be replayed
+    # against the original record.
+    source_sample: int = -1
+    source_beat_condition: str = ""                      # label from beat morphology
+    source_rhythm_condition: str = ""                    # label from rhythm context
 
 
 @dataclass
@@ -90,6 +99,8 @@ class FilePayload:
     events: List[EventPayload]
     record_metadata: Dict[str, Any]
     max_vital_history: int = 30
+    source_fs: float = 0.0                               # raw sampling rate, Hz
+    source_channels: Tuple[str, ...] = ()                # raw channel names as read
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +189,22 @@ class HDF5Writer:
         for k, v in attrs.items():
             self._set_attr(meta, k, v)
 
+        # Source provenance. Out-of-band relative to the strict schema, but
+        # without it an event cannot be traced back to the record it came
+        # from -- which makes the file unauditable.
+        rec_md = payload.record_metadata or {}
+        # Prefer the channels actually read over whatever the loader chose
+        # to record, so traceability does not depend on per-loader metadata.
+        channels = payload.source_channels or rec_md.get("channels_raw") or []
+        for k, v in (
+            ("source_dataset",        payload.dataset),
+            ("source_record_path",    str(rec_md.get("source_record_path", ""))),
+            ("source_channels",       ",".join(str(c) for c in channels)),
+            ("source_sampling_rate",  float(payload.source_fs)),
+            ("source_n_samples",      int(rec_md.get("n_samples_raw", 0))),
+        ):
+            self._set_attr(meta, k, v)
+
     # ------------------------------------------------------------------ #
     # /event_NNNN
     # ------------------------------------------------------------------ #
@@ -185,16 +212,30 @@ class HDF5Writer:
         grp_name = f"event_{index:04d}"
         grp = f.create_group(grp_name)
 
-        # Group-level attributes -- exactly the three spec'd fields.
+        # Group-level attributes -- the three spec'd fields ...
         self._set_attr(grp, "condition", evt.condition)
         self._set_attr(grp, "heart_rate", float(evt.heart_rate_bpm))
         self._set_attr(grp, "event_timestamp", float(evt.event_timestamp_epoch))
+
+        # ... plus out-of-band traceability. ``condition`` is the alarm-priority
+        # winner between the beat morphology and the background rhythm; both
+        # inputs are kept here so a consumer can re-derive a morphology-first
+        # label without re-running the pipeline.
+        self._set_attr(grp, "source_label", evt.source_label)
+        self._set_attr(grp, "source_sample", int(evt.source_sample))
+        self._set_attr(grp, "source_beat_condition", evt.source_beat_condition)
+        self._set_attr(grp, "source_rhythm_condition", evt.source_rhythm_condition)
 
         # Scalar datasets at the event root.
         grp.create_dataset(
             "timestamp", data=np.float64(evt.event_timestamp_epoch),
         )
-        evt_uuid = (evt.extras or {}).get("uuid") or str(uuid.uuid4())
+        # The pipeline always supplies a deterministic uuid5; this fallback
+        # keeps direct writer users reproducible too.
+        evt_uuid = (evt.extras or {}).get("uuid") or str(uuid.uuid5(
+            uuid.NAMESPACE_OID,
+            f"{evt.condition}/{evt.event_timestamp_epoch!r}/{index}",
+        ))
         grp.create_dataset("uuid", data=np.bytes_(evt_uuid.encode("utf-8")))
 
         # ECG: 7 leads + spec'd pacer extras. Per-lead provenance becomes

@@ -107,12 +107,7 @@ class LeadMapper:
         if not limb and not precordial:
             raise ValueError("no recognisable ECG channels in input")
 
-        # Reference length: every output lead must have this many samples.
-        # Use the first input we see; all inputs should already be aligned.
-        any_signal = next(iter({**limb, **precordial}.values()))
-        n = any_signal.size
-
-        I, II, III, src_I, src_II = self._resolve_limb(limb, n=n, fs=fs)
+        I, II, III, src_I, src_II = self._resolve_limb(limb, fs=fs)
 
         leads: Dict[str, LeadResult] = {}
         leads["ECG1"] = LeadResult(I.astype(np.float32), src_I)
@@ -206,7 +201,7 @@ class LeadMapper:
         return limb, precordial
 
     def _resolve_limb(
-        self, limb: Dict[str, np.ndarray], n: int, fs: float,
+        self, limb: Dict[str, np.ndarray], fs: float,
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], ExtrasTag, ExtrasTag]:
         """Return (I, II, III?, extras_I, extras_II).
 
@@ -269,14 +264,15 @@ class LeadMapper:
                 ExtrasTag(SOURCE_SYNTHETIC, METHOD_RULE_BASED,
                           "II synthesised from III (1-limb-lead record)"),
             )
-        # No limb leads at all: build I/II from a precordial substitute.
-        # Defer to caller; we do not arrive here when input has only V-leads
-        # because the public ``map`` enforces at least one usable channel.
-        zeros = np.zeros(n, dtype=np.float64)
-        return (
-            zeros, zeros, None,
-            ExtrasTag(SOURCE_SYNTHETIC, METHOD_RULE_BASED, "no limb leads -- zero-filled"),
-            ExtrasTag(SOURCE_SYNTHETIC, METHOD_RULE_BASED, "no limb leads -- zero-filled"),
+        # No limb leads at all (e.g. MIT-BIH records 102/104, which carry
+        # V5+V2 only). Every limb-lead output would be fabricated from a
+        # precordial channel, and Lead II drives HR, PPG and RESP -- so the
+        # whole event would be invention. Refuse rather than emit a
+        # plausible-looking zero-filled montage; see docs/ASSUMPTIONS.md #2.
+        raise ValueError(
+            "no limb leads in input (available channels: "
+            f"{sorted(limb) + ['<precordial only>']}); cannot derive I/II. "
+            "Records without at least one limb lead are not convertible."
         )
 
     # Lead synthesis primitives ----------------------------------------------

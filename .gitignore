@@ -1,0 +1,7 @@
+# Downloaded source datasets (PhysioNet). Large and re-fetchable:
+#   python -c "import wfdb; wfdb.dl_database('incartdb', dl_dir='data/incart')"
+data/
+
+# Converted HDF5 corpora. Regenerate with scripts/process_mitbih.py or the
+# INCART recipe in README.md; output is byte-reproducible from a given seed.
+out/

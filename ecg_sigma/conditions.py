@@ -73,22 +73,23 @@ MITBIH_BEAT_MAP: Dict[str, str] = {
 # Strings begin with '(' in the WFDB aux_note field.
 # --------------------------------------------------------------------------- #
 MITBIH_RHYTHM_MAP: Dict[str, str] = {
-    "(N": NORMAL_SINUS,
+    "(N": NORMAL_SINUS,   # Normal sinus rhythm
     "(NSR": NORMAL_SINUS,
-    "(SBR": BRADYCARDIA,
-    "(B": BRADYCARDIA,
-    "(SVTA": TACHYCARDIA,
-    "(T": TACHYCARDIA,
-    "(VT": VTACH,
-    "(VFL": VFIB,
+    "(SBR": BRADYCARDIA,  # Sinus bradycardia -- the ONLY bradycardia code
+    "(B": PVC,            # Ventricular BIGEMINY (not bradycardia): a PVC pattern
+    "(T": PVC,            # Ventricular TRIGEMINY (not tachycardia): a PVC pattern
+    "(SVTA": TACHYCARDIA, # Supraventricular tachyarrhythmia
+    "(VT": VTACH,         # Ventricular tachycardia
+    "(VFL": VFIB,         # Ventricular flutter
     "(VF": VFIB,
-    "(AFIB": AFIB,
-    "(AB": PAUSE,         # Atrial bigeminy treated as 'other rhythm'
+    "(AFIB": AFIB,        # Atrial fibrillation
     "(AFL": AFIB,         # Atrial flutter (close family)
-    "(IVR": OTHER,
-    "(P": PACED,
-    "(PREX": OTHER,
-    "(BII": OTHER,
+    "(AB": PAC,           # Atrial bigeminy -- a PAC pattern
+    "(NOD": OTHER,        # Nodal (A-V junctional) rhythm -- no unified label
+    "(IVR": OTHER,        # Idioventricular rhythm
+    "(P": PACED,          # Paced rhythm
+    "(PREX": OTHER,       # Pre-excitation (WPW)
+    "(BII": OTHER,        # 2-degree heart block
 }
 
 
@@ -134,12 +135,20 @@ PTBXL_SCP_MAP: Dict[str, str] = {
     "PACE": PACED,
 }
 
-# Priority order when a record has multiple labels: pick the most clinically
-# urgent label first.
-PTBXL_PRIORITY = (
-    VFIB, VTACH, MI, AFIB, PVC, PAC, LBBB, RBBB,
-    TACHYCARDIA, BRADYCARDIA, PAUSE, PACED, NORMAL_SINUS, OTHER,
+# Priority order used whenever two labels describe the same window: pick the
+# most clinically urgent. Used for PTB-XL's multi-label records and for
+# reconciling a MIT-BIH beat label against its background rhythm.
+# Ordered by what an ICU alarm would announce, most urgent first: lethal
+# ventricular rhythms, then the rate/pause alarms, then atrial rhythms, then
+# beat morphology, then baseline. Rate alarms deliberately outrank morphology
+# -- a PAC inside a sinus-bradycardia strip is still a bradycardia alarm.
+# Events keep their raw beat symbol and rhythm context as separate attributes,
+# so a consumer that wants morphology-first labels can re-derive them.
+CONDITION_PRIORITY = (
+    VFIB, VTACH, PAUSE, BRADYCARDIA, TACHYCARDIA, AFIB, MI,
+    PVC, PAC, LBBB, RBBB, PACED, NORMAL_SINUS, OTHER,
 )
+PTBXL_PRIORITY = CONDITION_PRIORITY   # back-compat alias
 
 
 def map_mitbih_beat(symbol: str) -> str:
@@ -152,23 +161,50 @@ def map_mitbih_rhythm(aux_note: str) -> Optional[str]:
 
     Returns ``None`` for an empty string or an unrecognised note so that
     callers can decide whether to fall back to a beat-based label.
+
+    WFDB pads aux notes to an even byte count with a trailing NUL, so a
+    plain ``str.strip()`` leaves ``'(AFIB\x00'`` intact and every lookup
+    misses. Strip NULs (and other control padding) explicitly.
     """
     if not aux_note:
         return None
-    key = aux_note.strip().split()[0]
+    cleaned = aux_note.strip().strip("\x00").strip()
+    if not cleaned:
+        return None
+    key = cleaned.split()[0]
     return MITBIH_RHYTHM_MAP.get(key)
+
+
+def resolve_condition(*candidates: Optional[str]) -> str:
+    """Reduce several condition labels for one window to the most urgent.
+
+    A MIT-BIH beat carries two independent descriptions: its own morphology
+    (``V`` -> PVC) and the background rhythm it sits in (``(AFIB`` -> AFIB).
+    Letting the rhythm blindly win erases every ectopic beat inside a sinus
+    strip; letting the beat win erases VT/AFIB runs. Ranking both through
+    :data:`CONDITION_PRIORITY` keeps whichever an alarm would actually
+    announce -- a PVC during sinus stays PVC, a ``V`` beat inside a ``(VT``
+    run becomes VTACH.
+    """
+    present = {c for c in candidates if c}
+    if not present:
+        return OTHER
+    for label in CONDITION_PRIORITY:
+        if label in present:
+            return label
+    return OTHER
 
 
 def map_ptbxl_labels(scp_codes: Iterable[str]) -> str:
     """Map an iterable of PTB-XL SCP codes to a unified label.
 
     PTB-XL is multi-label per record. We translate each code into the
-    unified vocabulary and then resolve the collision via :data:`PTBXL_PRIORITY`.
+    unified vocabulary and then resolve the collision via :data:`CONDITION_PRIORITY`.
     """
     candidates = {PTBXL_SCP_MAP.get(c, OTHER) for c in scp_codes}
     if not candidates:
         return OTHER
-    for label in PTBXL_PRIORITY:
+    for label in CONDITION_PRIORITY:
         if label in candidates:
             return label
     return OTHER

@@ -11,9 +11,22 @@ import h5py
 import numpy as np
 import pytest
 
-from ecg_sigma.conditions import BRADYCARDIA, NORMAL_SINUS, VTACH
+from ecg_sigma.conditions import (
+    AFIB,
+    ALL_CONDITIONS,
+    BRADYCARDIA,
+    LBBB,
+    NORMAL_SINUS,
+    OTHER,
+    PAC,
+    PVC,
+    TACHYCARDIA,
+    VTACH,
+    map_mitbih_rhythm,
+    resolve_condition,
+)
 from ecg_sigma.loaders.base import BeatAnnotation, PatientRecord
-from ecg_sigma.pipeline import Pipeline, PipelineConfig
+from ecg_sigma.pipeline import Pipeline, PipelineConfig, event_uuid
 from ecg_sigma.schema import (
     DEFAULT_LEADS,
     METHOD_DIRECT,
@@ -30,10 +43,12 @@ from ecg_sigma.signals.pacer import (
     unpack_pacer_info,
 )
 from ecg_sigma.signals.peaks import detect_r_peaks, heart_rate_bpm
+from ecg_sigma.signals.processor import SignalProcessor
 from ecg_sigma.signals.resampler import Resampler
 from ecg_sigma.validation import (
     REQUIRED_METADATA_ATTRS,
     REQUIRED_VITALS,
+    ValidationError,
     validate_pipeline_output,
 )
 
@@ -367,6 +382,206 @@ def test_pipeline_is_deterministic():
             # Pacer is also deterministic.
             assert (_read_json(fa["event_1001/ecg/extras"])
                     == _read_json(fb["event_1001/ecg/extras"]))
+
+
+# --------------------------------------------------------------------------- #
+# Label mapping and reconciliation
+# --------------------------------------------------------------------------- #
+def test_rhythm_aux_note_tolerates_wfdb_nul_padding():
+    """WFDB pads aux notes to an even byte count with a trailing NUL.
+
+    Without an explicit strip, 94% of MIT-BIH rhythm annotations parse as
+    None and VTACH/BRADYCARDIA/AFIB vanish from the output entirely.
+    """
+    for raw, expected in (
+        ("(AFIB\x00", AFIB),
+        ("(AFIB", AFIB),
+        (" (VT\x00 ", VTACH),
+        ("(SBR\x00", BRADYCARDIA),
+    ):
+        assert map_mitbih_rhythm(raw) == expected, raw
+    assert map_mitbih_rhythm("") is None
+    assert map_mitbih_rhythm("\x00") is None
+
+
+def test_wfdb_bigeminy_trigeminy_are_not_rate_alarms():
+    """`(B` is ventricular BIGEMINY and `(T` is TRIGEMINY.
+
+    Reading them as bradycardia/tachycardia invents ~1400 phantom
+    rate-alarm events across MIT-BIH.
+    """
+    assert map_mitbih_rhythm("(B\x00") == PVC
+    assert map_mitbih_rhythm("(T\x00") == PVC
+    assert map_mitbih_rhythm("(SBR\x00") == BRADYCARDIA
+    assert map_mitbih_rhythm("(SVTA\x00") == TACHYCARDIA
+
+
+def test_resolve_condition_keeps_ectopics_and_promotes_runs():
+    # A PVC inside a sinus strip stays a PVC ...
+    assert resolve_condition(PVC, NORMAL_SINUS) == PVC
+    # ... but a V beat inside a VT run is announced as VTACH.
+    assert resolve_condition(PVC, VTACH) == VTACH
+    # Rate alarms outrank beat morphology.
+    assert resolve_condition(PAC, BRADYCARDIA) == BRADYCARDIA
+    # Rhythm-only and beat-only both pass through.
+    assert resolve_condition(None, AFIB) == AFIB
+    assert resolve_condition(LBBB, None) == LBBB
+    assert resolve_condition(None, None) == OTHER
+
+
+# --------------------------------------------------------------------------- #
+# Lead mapping preconditions
+# --------------------------------------------------------------------------- #
+def test_lead_mapper_refuses_precordial_only_input():
+    """MIT-BIH 102/104 carry V5+V2 and no limb lead.
+
+    Six of seven output leads plus HR/PPG/RESP descend from Lead II, so a
+    zero-filled montage would be pure invention that still passes a
+    structural check.
+    """
+    n = 2400
+    v5 = np.sin(np.linspace(0, 40, n))
+    v2 = np.cos(np.linspace(0, 40, n))
+    with pytest.raises(ValueError, match="no limb leads"):
+        LeadMapper().map({"V5": v5, "V2": v2}, fs=200.0)
+
+
+def test_pipeline_raises_configuration_error_on_short_record():
+    """PTB-XL's 10 s records against the default 12 s window."""
+    from ecg_sigma.pipeline import ConfigurationError
+
+    fs = 500.0
+    n = int(10 * fs)
+    sig = _synth_ecg(fs, 10.0, hr_bpm=70.0)
+    record = PatientRecord(
+        patient_id="SHORT001", dataset="ptbxl", fs=fs,
+        signals={"I": sig, "II": sig * 1.1},
+        beat_annotations=[BeatAnnotation(sample=n // 2, symbol="N")],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = PipelineConfig(output_dir=tmp, workers=1)
+        with pytest.raises(ConfigurationError, match="schema window is 12s"):
+            Pipeline(cfg).process_record(record)
+
+
+# --------------------------------------------------------------------------- #
+# Content validation
+# --------------------------------------------------------------------------- #
+def _write_one_file(tmp: str, seed: int = 3) -> str:
+    cfg = PipelineConfig(output_dir=tmp, workers=1, random_seed=seed)
+    cfg.datasets["mitbih"] = {
+        "enabled": False, "max_events_per_record": 2, "beat_symbols": ["N", "V"],
+    }
+    paths = Pipeline(cfg).process_record(_synth_record())
+    assert paths
+    return paths[0]
+
+
+def test_validator_rejects_flat_lead():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_one_file(tmp)
+        with h5py.File(path, "r+") as f:
+            f["event_1001/ecg/ECG1"][...] = 0.0
+        with pytest.raises(ValidationError, match="flat"):
+            validate_pipeline_output(path)
+
+
+def test_validator_rejects_condition_outside_vocabulary():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_one_file(tmp)
+        with h5py.File(path, "r+") as f:
+            f["event_1001"].attrs["condition"] = np.bytes_(b"SOMETHING_ELSE")
+        with pytest.raises(ValidationError, match="not in the unified"):
+            validate_pipeline_output(path)
+
+
+def test_validator_requires_lead_provenance_attrs():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_one_file(tmp)
+        with h5py.File(path, "r+") as f:
+            del f["event_1001/ecg/ECG2"].attrs["source"]
+        with pytest.raises(ValidationError, match="missing provenance attr"):
+            validate_pipeline_output(path)
+
+
+def test_validator_detects_heart_rate_disagreeing_with_vitals():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_one_file(tmp)
+        with h5py.File(path, "r+") as f:
+            f["event_1001"].attrs["heart_rate"] = np.float64(180.0)
+        with pytest.raises(ValidationError, match="disagrees with"):
+            validate_pipeline_output(path)
+
+
+def test_validator_warns_on_low_quality_score():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_one_file(tmp)
+        with h5py.File(path, "r+") as f:
+            f["metadata"].attrs["data_quality_score"] = np.float64(0.05)
+        warnings = validate_pipeline_output(path)
+        assert any("data_quality_score" in w for w in warnings)
+
+
+# --------------------------------------------------------------------------- #
+# Quality score
+# --------------------------------------------------------------------------- #
+def test_quality_score_ranks_clean_above_noisy_and_flat():
+    fs = 200.0
+    clean = _synth_ecg(fs, 12.0, hr_bpm=70.0, seed=0)
+    rng = np.random.default_rng(5)
+    noisy = clean + rng.normal(0.0, 0.6, size=clean.size)
+    flat = np.zeros_like(clean)
+
+    q_clean = SignalProcessor.quality_score(clean, fs)
+    q_noisy = SignalProcessor.quality_score(noisy, fs)
+    q_flat = SignalProcessor.quality_score(flat, fs)
+
+    assert q_flat == 0.0
+    assert q_noisy < q_clean
+    # The old metric measured power above 40 Hz -- the bandpass stopband --
+    # and so pinned everything at ~1.0. Guard against regressing to that.
+    assert q_clean < 0.99
+
+
+# --------------------------------------------------------------------------- #
+# Determinism and traceability
+# --------------------------------------------------------------------------- #
+def test_pipeline_output_is_byte_identical_across_runs():
+    """The whole file, not just the signal arrays.
+
+    Event UUIDs used to come from uuid4, so two runs never matched.
+    """
+    record = _synth_record()
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        path_a = _write_one_file(a, seed=13)
+        path_b = _write_one_file(b, seed=13)
+        assert open(path_a, "rb").read() == open(path_b, "rb").read()
+
+
+def test_event_uuid_is_stable_under_event_filtering():
+    """Keyed on the source sample, not the output index."""
+    first = event_uuid("mitbih", "208", 32719)
+    assert first == event_uuid("mitbih", "208", 32719)
+    assert first != event_uuid("mitbih", "208", 32720)
+    assert first != event_uuid("incart", "208", 32719)
+
+
+def test_output_carries_source_traceability():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_one_file(tmp)
+        with h5py.File(path, "r") as f:
+            md = f["metadata"].attrs
+            assert _attr_str(md["source_dataset"]) == "mitbih"
+            assert _attr_str(md["source_channels"]) == "MLII,V1"
+            assert float(md["source_sampling_rate"]) == 360.0
+
+            evt = f["event_1001"]
+            assert _attr_str(evt.attrs["source_label"]) in ("N", "V")
+            assert int(evt.attrs["source_sample"]) >= 0
+            # Both label inputs survive, so a consumer can re-derive a
+            # morphology-first label without re-running the pipeline.
+            beat = _attr_str(evt.attrs["source_beat_condition"])
+            assert beat in ALL_CONDITIONS
 
 
 if __name__ == "__main__":

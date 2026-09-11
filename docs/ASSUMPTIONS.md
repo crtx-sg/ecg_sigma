@@ -35,6 +35,12 @@ per-lead "real vs synthetic" status lives as **HDF5 attributes**
 (`source`, `method`, `notes`, `units`) on each lead dataset rather than
 inside the JSON.
 
+Source traceability lives alongside it, also out-of-band: `/metadata`
+carries `source_dataset`, `source_record_path`, `source_channels`,
+`source_sampling_rate` and `source_n_samples`, and each event carries
+`source_label`, `source_sample`, `source_beat_condition` and
+`source_rhythm_condition` (see §5c).
+
 ---
 
 ## 2. Lead derivation
@@ -65,10 +71,16 @@ Derived leads in this case are tagged
 choose to discard them.
 
 ### No limb leads
-Treated as a load failure: the lead mapper raises
-`ValueError("no recognisable ECG channels in input")`. Add a precordial-
-only synthesiser if a dataset that lacks limb leads ever becomes a
-target.
+Treated as a load failure: `LeadMapper._resolve_limb` raises
+`ValueError("no limb leads in input ...")` and the pipeline skips the
+record with an error. Six of the seven output leads plus HR, PPG and
+RESP all descend from Lead II, so a precordial-only record would be
+almost entirely invention.
+
+This is not hypothetical: **MIT-BIH records 102 and 104 carry V5+V2 with
+no limb lead** and are excluded from the output for this reason (46 of
+48 records convert). Add a precordial-only synthesiser only if you are
+willing to label those events wholly synthetic.
 
 ---
 
@@ -203,6 +215,58 @@ first byte of `pacer_info` (`pi & 0xFF`) is `0`, matching the documented
 
 ---
 
+## 5c. Condition labels: reconciling beat vs rhythm
+
+A MIT-BIH beat carries two independent descriptions: its own morphology
+(`V` → PVC) and the background rhythm it sits in (`(AFIB` → AFIB). They
+are reconciled by clinical urgency via
+`conditions.CONDITION_PRIORITY` / `resolve_condition()`:
+
+```
+VFIB > VTACH > PAUSE > BRADYCARDIA > TACHYCARDIA > AFIB > MI
+     > PVC > PAC > LBBB > RBBB > PACED > NORMAL_SINUS > OTHER
+```
+
+Rate alarms deliberately outrank beat morphology: a PAC inside a
+sinus-bradycardia strip is still a bradycardia alarm. The trade-off is
+visible in the MIT-BIH output — alarm-first labelling recovers 1,780
+BRADYCARDIA and 468 TACHYCARDIA beats that morphology-first labelling
+loses entirely, at the cost of ~1,850 PAC and ~400 RBBB beats that get
+absorbed into the surrounding rhythm.
+
+**The trade-off is reversible.** Every event stores both raw inputs, so
+a consumer wanting morphology-first labels can re-derive them without
+re-running the pipeline:
+
+```
+event_1001.attrs["condition"]                # alarm-priority winner
+event_1001.attrs["source_beat_condition"]    # from beat morphology alone
+event_1001.attrs["source_rhythm_condition"]  # from rhythm context alone
+event_1001.attrs["source_label"]             # raw WFDB symbol / SCP codes
+event_1001.attrs["source_sample"]            # onset index at source fs
+```
+
+### WFDB rhythm codes
+
+Two codes are easy to misread and were previously mapped wrong:
+
+| Code | Meaning | Maps to |
+|------|---------|---------|
+| `(B`   | Ventricular **bigeminy** (*not* bradycardia) | PVC |
+| `(T`   | Ventricular **trigeminy** (*not* tachycardia) | PVC |
+| `(SBR` | Sinus bradycardia — the only bradycardia code | BRADYCARDIA |
+| `(SVTA`| Supraventricular tachyarrhythmia | TACHYCARDIA |
+| `(AB`  | Atrial bigeminy | PAC |
+
+MIT-BIH contains exactly **one** `(SBR` annotation (record 232) and 26
+`(SVTA`. Treat MIT-BIH as a weak source for rate-alarm classes.
+
+WFDB pads `aux_note` to an even byte count with a trailing NUL, so
+`'(AFIB\x00'` is what actually arrives; `map_mitbih_rhythm` strips it.
+Without that strip 94% of rhythm annotations are silently dropped.
+
+---
+
 ## 6. Event timestamps
 
 Public datasets do not carry absolute wall-clock time. We anchor to the
@@ -226,12 +290,28 @@ Both `event_*/timestamp` and the per-vital `timestamp` are stored as
 `data_quality_score` is a derived heuristic in `[0, 1]`:
 
 ```
-quality = (1 - nan_ratio) * (qrs_band_power / (qrs_band_power + noise_band_power))
+quality = (1 - nan_ratio) * qrs / (qrs + baseline + hf_noise)
 ```
 
-where the QRS band is 5–15 Hz and the noise band is ≥ 40 Hz. This
-discriminates "totally bad" from "mostly OK" segments. It is **not**
-clinical-grade; replace via configuration if a real PSI/SQI metric is
+using mean Welch band power over
+
+| Term | Band | What it captures |
+|------|------|------------------|
+| `qrs`       | 5–15 Hz  | QRS complexes |
+| `baseline`  | 0.5–5 Hz | drift, motion, respiration artefact |
+| `hf_noise`  | 15–40 Hz | EMG / muscle / electrode noise |
+
+All three bands sit **inside** the 0.5–40 Hz passband left by
+`preprocess()`. An earlier version measured "noise" above 40 Hz — which
+is the bandpass *stopband* — so every window scored ≈1.0 regardless of
+content. Flat windows score 0.
+
+Observed on MIT-BIH: **0.38–0.49** on records PhysioNet calls clean
+(100, 103, 115, 123) and **0.10–0.34** on the ones it flags as noisy
+(105, 108, 203, 207, 222). `validate_pipeline_output` emits a soft
+warning below `LOW_QUALITY_WARN_BELOW` (0.20).
+
+It is **not** clinical-grade; replace it if a real PSI/SQI metric is
 needed.
 
 ---
@@ -255,9 +335,14 @@ mathematically required and not a clinical compromise.
 * Pacer descriptors, vital values, history arrays, posture labels, and
   UUIDs all inherit this determinism within an RNG.
 
-UUIDs are generated via `uuid.uuid4()` at write time. If you need them
-deterministic too, swap to `uuid.uuid5(NAMESPACE, f"{patient_id}/{event_idx}")`
-in `pipeline.py::_build_event_payload`.
+UUIDs are `uuid.uuid5` over a fixed namespace and the event's *identity*
+in the source data — `f"{dataset}/{patient_id}/{source_sample}"` — see
+`pipeline.py::event_uuid`. Keying on the source sample rather than the
+output index means filtering or re-ordering events does not renumber the
+survivors. Two runs over the same input are byte-identical.
+
+The namespace UUID is fixed for the life of the schema: changing it
+renames every event in every previously-generated file.
 
 ---
 

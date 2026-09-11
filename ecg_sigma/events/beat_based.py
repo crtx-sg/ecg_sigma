@@ -7,9 +7,13 @@ manageable and avoid massive class imbalance, callers can:
   * cap the number of events per record (``max_events_per_record``)
   * stride to subsample dense streams (``stride``)
 
-When a beat annotation falls inside an active rhythm window (e.g.
-``(AFIB``), we override the beat-derived condition with the rhythm
-label. This better matches what alarm systems actually announce.
+A beat carries two independent descriptions: its own morphology (``V``)
+and the background rhythm it sits in (``(AFIB``). We reconcile them by
+clinical urgency (:func:`ecg_sigma.conditions.resolve_condition`) rather
+than letting either blindly win -- a PVC inside a sinus strip stays PVC,
+while a ``V`` beat inside a ``(VT`` run is promoted to VTACH. This
+matches what an alarm would actually announce. Both raw labels are kept
+in ``Event.metadata`` for traceability.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from ..conditions import (
     OTHER,
     map_mitbih_beat,
     map_mitbih_rhythm,
+    resolve_condition,
 )
 from .base import Event, EventExtractor
 
@@ -74,7 +79,7 @@ class BeatBasedExtractor(EventExtractor):
 
             beat_cond = map_mitbih_beat(ann.symbol)
             rhythm_cond = self._rhythm_at(rhythm_segments, ann.sample)
-            condition = rhythm_cond or beat_cond
+            condition = resolve_condition(beat_cond, rhythm_cond)
 
             if self.cfg.drop_other and condition == OTHER:
                 continue
@@ -86,6 +91,7 @@ class BeatBasedExtractor(EventExtractor):
                 metadata={
                     "beat_symbol": ann.symbol,
                     "aux_note": ann.aux_note,
+                    "beat_condition": beat_cond,
                     "rhythm_context": rhythm_cond or "",
                 },
             ))

@@ -80,18 +80,27 @@ class SignalProcessor:
     # ------------------------------------------------------------------ #
     # Quality scoring
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def quality_score(x: np.ndarray, fs: float) -> float:
-        """Heuristic [0, 1] quality score combining NaN ratio and SNR.
+    # Bands used by :meth:`quality_score`. All three sit *inside* the
+    # pre-processor's passband, so the score measures the signal rather
+    # than the filter's stopband.
+    QRS_BAND_HZ = (5.0, 15.0)
+    BASELINE_BAND_HZ = (0.5, 5.0)     # drift, motion, respiration artefact
+    HF_NOISE_BAND_HZ = (15.0, 40.0)   # EMG / muscle / electrode noise
 
-        - NaN ratio -> direct linear penalty.
-        - SNR proxy -> ratio of band-power in 5-15 Hz (QRS band) to power
-          in 40-(fs/2) Hz (likely noise). Mapped through a saturating
-          function so saturated values do not dominate the score.
+    @classmethod
+    def quality_score(cls, x: np.ndarray, fs: float) -> float:
+        """Heuristic [0, 1] in-band SQI for a pre-processed ECG window.
 
-        This is intentionally crude: it discriminates "totally bad" from
-        "mostly OK" segments and is good enough to flag for downstream
-        QC. It is not a clinical-grade quality metric.
+        ``quality = (1 - nan_ratio) * qrs / (qrs + baseline + hf_noise)``
+
+        where each term is mean Welch band power. All three bands lie
+        inside the 0.5-40 Hz passband that :meth:`preprocess` leaves
+        behind: an earlier version measured "noise" above 40 Hz, which is
+        the bandpass *stopband*, so every window scored ~1.0 regardless of
+        content. A flat window scores 0.
+
+        Still deliberately crude -- it separates "unusable" from "mostly
+        OK" for downstream QC. It is not a clinical-grade metric.
         """
         x = np.asarray(x, dtype=np.float64)
         if x.size == 0:
@@ -100,15 +109,21 @@ class SignalProcessor:
         x_clean = x[np.isfinite(x)]
         if x_clean.size < int(fs):  # < 1 s of usable data
             return max(0.0, 1.0 - nan_ratio) * 0.1
+        if float(np.ptp(x_clean)) <= 0.0:
+            return 0.0              # flat channel carries no signal
 
         # Welch PSD; reasonable nperseg for short windows.
         nperseg = min(x_clean.size, int(2 * fs))
         f, pxx = sp_signal.welch(x_clean, fs=fs, nperseg=nperseg)
-        qrs_band = (f >= 5.0) & (f <= 15.0)
-        noise_band = f >= 40.0
-        qrs_power = float(np.mean(pxx[qrs_band])) if qrs_band.any() else 0.0
-        noise_power = float(np.mean(pxx[noise_band])) if noise_band.any() else 1e-12
-        snr = qrs_power / max(noise_power, 1e-12)
-        # squashed: 0 at snr=0, ~0.95 at snr=20
-        snr_score = snr / (snr + 1.0)
-        return float(np.clip((1.0 - nan_ratio) * snr_score, 0.0, 1.0))
+
+        def band_power(lo: float, hi: float) -> float:
+            mask = (f >= lo) & (f < hi)
+            return float(np.mean(pxx[mask])) if mask.any() else 0.0
+
+        qrs = band_power(*cls.QRS_BAND_HZ)
+        baseline = band_power(*cls.BASELINE_BAND_HZ)
+        hf = band_power(*cls.HF_NOISE_BAND_HZ)
+        total = qrs + baseline + hf
+        if total <= 0.0:
+            return 0.0
+        return float(np.clip((1.0 - nan_ratio) * (qrs / total), 0.0, 1.0))

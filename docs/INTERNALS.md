@@ -75,12 +75,20 @@ each annotation `ann`:
    Q, ?         → OTHER
    ```
 
-5. **Rhythm context overrides beat label** — MIT-BIH encodes rhythm
-   changes as an `aux_note` like `"(AFIB"` attached to a beat. The
-   extractor pre-computes the active rhythm at every sample by scanning
-   all `aux_note` entries once. A beat that lands inside an `(AFIB`
-   window is reported as `condition=AFIB` regardless of its own beat
-   symbol — matching how alarm systems actually announce rhythm state.
+5. **Beat and rhythm labels are reconciled by urgency** — MIT-BIH
+   encodes rhythm changes as an `aux_note` like `"(AFIB"` attached to a
+   beat. The extractor pre-computes the active rhythm at every sample by
+   scanning all `aux_note` entries once, then feeds *both* the beat's own
+   label and the rhythm label through
+   `conditions.resolve_condition()`, which picks the more urgent per
+   `CONDITION_PRIORITY`. A `V` beat inside a sinus strip stays `PVC`; the
+   same beat inside a `(VT` run becomes `VTACH`. Letting the rhythm win
+   outright would erase every ectopic beat in the corpus. Both raw labels
+   are kept in `Event.metadata` and written to the event group as
+   `source_beat_condition` / `source_rhythm_condition`.
+
+   Note that WFDB returns NUL-padded aux notes (`"(AFIB\x00"`);
+   `map_mitbih_rhythm` strips that before lookup.
    ```
    (AFIB           → AFIB
    (VT             → VTACH
@@ -153,8 +161,9 @@ For each `Event`:
    VT/VF/Brady and uniform 20–80 % otherwise; bit-packs
    `(type, rate, amplitude, flags)` into `pacer_info`.
 
-10. **Quality score** computed from NaN ratio + QRS-band/noise-band
-    power ratio on the canonical Lead II.
+10. **Quality score** computed on the canonical Lead II as
+    `qrs / (qrs + baseline + hf_noise)` over three bands that all lie
+    inside the 0.5–40 Hz passband — see ASSUMPTIONS.md §7.
 
 The result is an `EventPayload` that feeds the writer.
 
@@ -199,10 +208,10 @@ events written to 100_2025-01.h5:   200
 
 The output file ends up with `event_1001`..`event_1200`, each a
 12-second 7-lead ECG window centred on its trigger beat, with the
-matching condition (`NORMAL_SINUS` / `PAC` / `PVC` /
-`AFIB`-when-in-rhythm-context), synthesised PPG / RESP, vitals +
-history + thresholds, pacer descriptor, and a deterministic UUID +
-timestamp.
+matching condition (the alarm-priority winner between beat morphology
+and rhythm context), synthesised PPG / RESP, vitals + history +
+thresholds, pacer descriptor, source-traceability attributes, and a
+deterministic `uuid5` + timestamp.
 
 ---
 

@@ -14,6 +14,11 @@ Two layers:
        + history for XL_Posture.
      * Optional history-integrity check (``verify_history=True``) -- sort
        order, sample count, value bounds.
+
+   It also gates on *content*, not just structure: no flat/zero-filled
+   waveform, every ``condition`` inside the unified vocabulary, every
+   waveform carrying its ``source``/``method`` provenance attributes, and
+   ``heart_rate`` agreeing with ``vitals/HR/value``.
 """
 
 from __future__ import annotations
@@ -26,9 +31,12 @@ from typing import Any, Dict, List, Tuple
 import h5py
 import numpy as np
 
+from ..conditions import ALL_CONDITIONS
 from ..schema import (
     DEFAULT_LEADS,
     SCHEMA,
+    SOURCE_REAL,
+    SOURCE_SYNTHETIC,
     SchemaSpec,
     required_window_lengths,
 )
@@ -59,6 +67,27 @@ REQUIRED_VITALS = (
 )
 STANDARD_VITALS = tuple(v for v in REQUIRED_VITALS if v != "XL_Posture")
 INT_VITALS = ("HR", "XL_Posture")
+
+# Provenance attributes every waveform dataset must carry so a consumer can
+# tell real signal from synthesis without re-running the pipeline.
+REQUIRED_PROVENANCE_ATTRS = ("source", "method")
+VALID_SOURCES = (SOURCE_REAL, SOURCE_SYNTHETIC)
+
+# A waveform whose peak-to-peak span is below this is flat: a dead channel,
+# a zero-fill, or a saturated segment. Never a usable ECG/PPG/RESP trace.
+FLATLINE_PTP_EPS = 1e-9
+
+# ``heart_rate`` (group attr, float bpm) and ``vitals/HR/value`` (int bpm)
+# come from one measurement; the generator clips to this band before
+# rounding, so they may differ by at most one bpm of rounding.
+_HR_CLIP = (25.0, 250.0)
+_HR_TOLERANCE_BPM = 1.0
+
+# Soft floor for /metadata data_quality_score. Empirically the in-band SQI
+# runs ~0.38-0.49 on clean MIT-BIH records and ~0.10-0.34 on the ones
+# PhysioNet flags as noisy, so this floor picks out the worst offenders
+# (e.g. records 203, 207) without failing them.
+LOW_QUALITY_WARN_BELOW = 0.20
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +139,12 @@ def _check_signal(name: str, sig: np.ndarray, expected_len: int) -> None:
         )
     if not np.all(np.isfinite(sig)):
         raise ValidationError(f"{name}: contains non-finite values")
+    ptp = float(np.ptp(sig))
+    if ptp < FLATLINE_PTP_EPS:
+        raise ValidationError(
+            f"{name}: flat channel (peak-to-peak {ptp:g}); refusing to write "
+            "a constant waveform"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +184,17 @@ def validate_pipeline_output(
             if k not in md:
                 raise ValidationError(f"/metadata missing attr {k!r}")
 
+        quality = float(md["data_quality_score"])
+        if not (0.0 <= quality <= 1.0):
+            raise ValidationError(
+                f"/metadata data_quality_score {quality} outside [0, 1]"
+            )
+        if quality < LOW_QUALITY_WARN_BELOW:
+            warnings.append(
+                f"data_quality_score {quality:.3f} is below "
+                f"{LOW_QUALITY_WARN_BELOW}; the source signal is likely noisy"
+            )
+
         max_vital_history = int(md["max_vital_history"])
         if max_vital_history <= 0:
             raise ValidationError(f"/metadata max_vital_history invalid: {max_vital_history}")
@@ -177,6 +223,13 @@ def validate_pipeline_output(
             for attr in ("condition", "heart_rate", "event_timestamp"):
                 if attr not in grp.attrs:
                     raise ValidationError(f"{ev} missing attr {attr!r}")
+
+            condition = _attr_to_str(grp.attrs["condition"])
+            if condition not in ALL_CONDITIONS:
+                raise ValidationError(
+                    f"{ev} condition {condition!r} is not in the unified "
+                    f"vocabulary {sorted(ALL_CONDITIONS)}"
+                )
 
             if "timestamp" not in grp:
                 raise ValidationError(f"{ev}/timestamp dataset missing")
@@ -227,6 +280,8 @@ def validate_pipeline_output(
                         required, extras["history"], max_vital_history, ev,
                     )
 
+            _check_heart_rate_agreement(grp, ev)
+
     return warnings
 
 
@@ -234,6 +289,12 @@ def validate_pipeline_output(
 # Helpers
 # --------------------------------------------------------------------------- #
 def _check_dataset(grp, path: str, expected_len: int, ev_name: str) -> None:
+    """Shape/dtype contract plus content and provenance gates.
+
+    Structure alone cannot tell a real waveform from a zero-fill, so this
+    also rejects flat channels and requires the ``source``/``method``
+    provenance attributes that carry the real-vs-synthetic answer.
+    """
     ds = grp.get(path)
     if ds is None:
         raise ValidationError(f"{ev_name}/{path} missing")
@@ -243,6 +304,50 @@ def _check_dataset(grp, path: str, expected_len: int, ev_name: str) -> None:
         )
     if ds.dtype != np.float32:
         raise ValidationError(f"{ev_name}/{path} dtype {ds.dtype} != float32")
+
+    data = ds[...]
+    if not np.all(np.isfinite(data)):
+        raise ValidationError(f"{ev_name}/{path} contains non-finite values")
+    ptp = float(np.ptp(data))
+    if ptp < FLATLINE_PTP_EPS:
+        raise ValidationError(
+            f"{ev_name}/{path} is flat (peak-to-peak {ptp:g}); a constant "
+            "channel is a zero-fill or dead lead, not a signal"
+        )
+
+    _check_provenance(ds, f"{ev_name}/{path}")
+
+
+def _check_provenance(ds, label: str) -> None:
+    """Every waveform must declare where it came from."""
+    for attr in REQUIRED_PROVENANCE_ATTRS:
+        if attr not in ds.attrs:
+            raise ValidationError(f"{label} missing provenance attr {attr!r}")
+    source = _attr_to_str(ds.attrs["source"])
+    if source not in VALID_SOURCES:
+        raise ValidationError(
+            f"{label} source {source!r} not one of {list(VALID_SOURCES)}"
+        )
+    if not _attr_to_str(ds.attrs["method"]).strip():
+        raise ValidationError(f"{label} has an empty 'method' provenance attr")
+
+
+def _check_heart_rate_agreement(grp, ev_name: str) -> None:
+    """``heart_rate`` group attr must match ``vitals/HR/value``.
+
+    They are two renderings of one measurement; a mismatch means the
+    vitals block drifted away from the ECG it is supposed to describe.
+    """
+    attr_hr = float(grp.attrs["heart_rate"])
+    if not math.isfinite(attr_hr):
+        raise ValidationError(f"{ev_name} heart_rate attr not finite: {attr_hr}")
+    vital_hr = float(np.array(grp["vitals/HR/value"]))
+    expected = round(min(max(attr_hr, _HR_CLIP[0]), _HR_CLIP[1]))
+    if abs(expected - vital_hr) > _HR_TOLERANCE_BPM:
+        raise ValidationError(
+            f"{ev_name} heart_rate attr {attr_hr:.2f} bpm disagrees with "
+            f"vitals/HR/value {vital_hr:.0f} bpm (expected ~{expected})"
+        )
 
 
 def _check_pacer_extras(grp, ev_name: str, n_ecg_samples: int) -> None:

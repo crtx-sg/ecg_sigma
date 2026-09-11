@@ -17,8 +17,9 @@ Flow per record:
         -> validate_pipeline_output() (smoke check)
 
 The pipeline is single-record-at-a-time so it scales to arbitrary dataset
-sizes. Optional record-level parallelism is exposed via the ``workers``
-config field.
+sizes: loaders are generators and :meth:`Pipeline.run` never materialises
+them. Optional record-level parallelism is exposed via the ``workers``
+config field, bounded to ``2 * workers`` resident records.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -65,6 +66,32 @@ from .writers import HDF5Writer
 from .writers.hdf5_writer import EventPayload, FilePayload
 
 _log = get_logger(__name__)
+
+# Namespace for deterministic event UUIDs. Fixed for the life of the schema:
+# changing it renames every event in every previously-generated file.
+_EVENT_UUID_NAMESPACE = uuid.UUID("6f9d1c2e-0b47-5a3e-9c81-2f5b7d4a6e30")
+
+
+class ConfigurationError(Exception):
+    """The config and the dataset cannot produce output as combined.
+
+    Distinct from a per-record data error: skipping and retrying will not
+    help, so :meth:`Pipeline.run` re-raises this even when ``fail_fast``
+    is off rather than logging it once per record.
+    """
+
+
+def event_uuid(dataset: str, patient_id: str, source_sample: int) -> str:
+    """Deterministic per-event UUID.
+
+    Keyed on the event's *identity* in the source data rather than on its
+    index in the output file, so filtering or re-ordering events does not
+    renumber the survivors, and two runs of the same input agree
+    byte-for-byte.
+    """
+    return str(uuid.uuid5(
+        _EVENT_UUID_NAMESPACE, f"{dataset}/{patient_id}/{source_sample}"
+    ))
 
 
 # --------------------------------------------------------------------------- #
@@ -133,26 +160,34 @@ class Pipeline:
     # Top-level API
     # ------------------------------------------------------------------ #
     def run(self) -> List[str]:
-        """Process all enabled datasets. Returns the list of written paths."""
-        records = list(self._collect_records())
-        if not records:
-            _log.warning("no records to process")
-            return []
+        """Process all enabled datasets. Returns the list of written paths.
 
-        if self.cfg.workers <= 1 or len(records) <= 1:
-            outputs = []
-            for rec in records:
+        Records are *streamed* from the loaders, never materialised into a
+        list: one INCART record is ~44 MB of float64 signal (12 leads x 30
+        min @ 257 Hz), so holding all 75 costs ~3.3 GB before any work
+        starts, and PTB-XL's 21,837 records would be hopeless.
+        """
+        if self.cfg.workers <= 1:
+            outputs: List[str] = []
+            seen = 0
+            for rec in self._collect_records():
+                seen += 1
                 try:
                     outputs.extend(self.process_record(rec))
+                except ConfigurationError:
+                    raise
                 except Exception:
                     if self.cfg.fail_fast:
                         raise
                     _log.exception("failed to process record %s", rec.patient_id)
+            if not seen:
+                _log.warning("no records to process")
             return outputs
-        return self._run_parallel(records)
+        return self._run_parallel(self._collect_records())
 
     def process_record(self, record: PatientRecord) -> List[str]:
         """Process one :class:`PatientRecord` end-to-end. Returns written paths."""
+        self._check_record_length(record)
         rng = seeded_rng(self.cfg.random_seed, record.patient_id)
         extractor = self._build_extractor(record)
         events = extractor.extract(record)
@@ -198,6 +233,8 @@ class Pipeline:
                 events=evts,
                 record_metadata=record.metadata,
                 max_vital_history=self.cfg.max_vital_history,
+                source_fs=float(record.fs),
+                source_channels=tuple(record.signals.keys()),
             )
             path = self.writer.write(file_payload)
             warnings = validate_pipeline_output(path, self.cfg.schema)
@@ -295,12 +332,50 @@ class Pipeline:
             vitals=vitals,
             pacer_info=int(pacer_info),
             pacer_offset=int(pacer_offset),
-            extras={"uuid": str(uuid.uuid4())},
+            extras={"uuid": event_uuid(
+                record.dataset, record.patient_id, evt.onset_sample,
+            )},
+            source_sample=int(evt.onset_sample),
+            source_beat_condition=str(evt.metadata.get("beat_condition", "")),
+            source_rhythm_condition=str(evt.metadata.get("rhythm_context", "")),
         )
 
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    def _check_record_length(self, record: PatientRecord) -> None:
+        """Refuse a record shorter than one output window.
+
+        Every event needs ``seconds_before + seconds_after`` of real signal.
+        A record shorter than that yields nothing at all, and the per-event
+        drop is easy to miss -- PTB-XL (10 s records against the default
+        12 s window) silently produced zero output for all 21,837 records.
+        Fail once, with the arithmetic and the fix.
+        """
+        schema = self.cfg.schema
+        if not record.signals:
+            raise ConfigurationError(
+                f"record {record.patient_id} ({record.dataset}) has no signals"
+            )
+        n_total = min(int(getattr(s, "size", 0)) for s in record.signals.values())
+        needed = int(round(schema.window_seconds * float(record.fs)))
+        if n_total >= needed:
+            return
+        max_half = int(n_total / float(record.fs)) // 2
+        raise ConfigurationError(
+            f"dataset {record.dataset!r}: record {record.patient_id} is "
+            f"{n_total / float(record.fs):.1f}s at {record.fs:g} Hz, but the "
+            f"schema window is {schema.window_seconds}s "
+            f"(seconds_before_event={schema.seconds_before_event} + "
+            f"seconds_after_event={schema.seconds_after_event}). Every event "
+            f"would fall off the record, so this dataset cannot be converted "
+            f"at the current window. Either set seconds_before_event and "
+            f"seconds_after_event to at most {max_half} each -- which produces "
+            f"a {int(2 * max_half * schema.ecg_fs)}-sample variant that is NOT "
+            f"interchangeable with the {schema.ecg_samples}-sample output from "
+            f"longer datasets -- or disable {record.dataset!r}."
+        )
+
     def _build_extractor(self, record: PatientRecord) -> EventExtractor:
         """Pick beat- vs rhythm-based extractor by what the record carries."""
         ds_cfg = self.cfg.datasets.get(record.dataset, {}) or {}
@@ -319,7 +394,7 @@ class Pipeline:
             ))
         return RhythmBasedExtractor(RhythmExtractorConfig(
             n_events=int(ds_cfg.get("max_events_per_record", 1) or 1),
-            label_set="ptbxl" if record.dataset == "ptbxl" else "ptbxl",
+            label_set="ptbxl",
         ))
 
     def _event_timestamp(self, record: PatientRecord, evt: Event) -> float:
@@ -389,24 +464,55 @@ class Pipeline:
     # ------------------------------------------------------------------ #
     # Multi-process
     # ------------------------------------------------------------------ #
-    def _run_parallel(self, records: List[PatientRecord]) -> List[str]:
+    def _run_parallel(self, records: Iterable[PatientRecord]) -> List[str]:
+        """Fan out over a bounded window of in-flight records.
+
+        Submitting every record up-front would pull the whole dataset into
+        the parent process (and again into the pickle buffers). We keep at
+        most ``2 * workers`` records resident, pulling the next one from the
+        loader only as a slot frees up.
+        """
         outputs: List[str] = []
         # The Pipeline holds simple, picklable config; workers just call
         # process_record on a freshly-constructed Pipeline.
         cfg = self.cfg
+        max_inflight = max(2, cfg.workers * 2)
+        source = iter(records)
+        seen = 0
+
         with ProcessPoolExecutor(max_workers=cfg.workers) as pool:
-            futures = {
-                pool.submit(_worker_process_record, cfg, rec): rec
-                for rec in records
-            }
-            for fut in as_completed(futures):
-                rec = futures[fut]
+            futures: Dict[Any, str] = {}
+
+            def submit_next() -> bool:
+                nonlocal seen
                 try:
-                    outputs.extend(fut.result())
-                except Exception:
-                    if cfg.fail_fast:
+                    rec = next(source)
+                except StopIteration:
+                    return False
+                futures[pool.submit(_worker_process_record, cfg, rec)] = rec.patient_id
+                seen += 1
+                return True
+
+            for _ in range(max_inflight):
+                if not submit_next():
+                    break
+
+            while futures:
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    patient_id = futures.pop(fut)
+                    try:
+                        outputs.extend(fut.result())
+                    except ConfigurationError:
                         raise
-                    _log.exception("worker failed on record %s", rec.patient_id)
+                    except Exception:
+                        if cfg.fail_fast:
+                            raise
+                        _log.exception("worker failed on record %s", patient_id)
+                    submit_next()
+
+        if not seen:
+            _log.warning("no records to process")
         return outputs
 
 
